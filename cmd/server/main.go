@@ -19,6 +19,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -273,12 +274,19 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// /v1/search 模型倍率缓存刷新间隔：复用 balance_refresh_minutes（同源上游）。
+		SearchRefreshInterval: cfg.BalanceRefreshInterval,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// /v1/search 模型倍率缓存后台刷新：启动即刷一次，之后按 balance_refresh_minutes
+	// 周期刷新（仅 balance_refresh_enabled 时启动；关闭则由 handler 请求路径惰性刷新）。
+	if cfg.BalanceRefreshInterval > 0 {
+		go searchRateRefreshLoop(ctx, p, up, cfg.BalanceRefreshInterval)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -317,6 +325,39 @@ func panelListenPath(listen string) string {
 		}
 	}
 	return listen
+}
+
+// searchRateRefreshLoop /v1/search 模型倍率缓存后台刷新：启动即刷一次（避免首个
+// /v1/search 请求冷启动等目录），之后按 interval 周期刷新。选号与 fetchDynamicModels
+// 同口径（首个可用 CN 账号）；失败只打 WARN，不中断循环（下次周期再试，handler
+// 请求路径的惰性刷新与负冷却兜底）。
+func searchRateRefreshLoop(ctx context.Context, p *pool.Pool, up *upstream.Client, interval time.Duration) {
+	refreshSearchRates(p, up)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refreshSearchRates(p, up)
+		}
+	}
+}
+
+// refreshSearchRates 单次倍率目录刷新（无号时静默跳过——零上游调用）。
+func refreshSearchRates(p *pool.Pool, up *upstream.Client) {
+	uids := p.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return
+	}
+	acct := p.AuthByUID(uids[0])
+	if acct == nil {
+		return
+	}
+	if _, err := up.RefreshModelRates(acct); err != nil {
+		log.Printf("WARN: [server] search model rates refresh acct=%s: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+	}
 }
 
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。

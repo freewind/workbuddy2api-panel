@@ -62,6 +62,11 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// SearchRefreshInterval /v1/search 模型倍率缓存刷新间隔（复用 config
+	// schedule.balance_refresh_minutes 解析值，缺省 5m；<=0 回落默认）。
+	// 复用原因：倍率与余额同源（同一上游目录），刷新频率对齐即可。
+	SearchRefreshInterval time.Duration
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -121,8 +126,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
+	if cfg.SearchRefreshInterval <= 0 {
+		cfg.SearchRefreshInterval = 5 * time.Minute
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -232,7 +241,22 @@ const (
 	// /v1/models 最多滞后一个 TTL。再短就不值得——每次失效都是 2 次上游探测。
 	dynamicModelsTTL        = 10 * time.Minute
 	modelsFetchFailCooldown = 5 * time.Minute
+
+	// searchRateFailCooldown /v1/search 倍率目录刷新失败的负冷却：上游持续故障时
+	// 不再逐请求打上游（与 dynamicModelsCache 负缓存同设计）。
+	searchRateFailCooldown = 2 * time.Minute
+
+	// searchMaxAttempts 单请求跨模型累计尝试上限——防「所有模型 × 所有账号」
+	// 在上游整体故障时把全池打满放大请求量（倍率名单通常 20+ 模型）。
+	searchMaxAttempts = 8
 )
+
+// searchRateCache /v1/search 倍率缓存的协调状态：倍率数据本体在 upstream 包级
+// 单例（upstream.ModelRatesSnapshot），此处只记最近一次刷新失败时间（负缓存）。
+var searchRateCache struct {
+	sync.Mutex
+	lastFail time.Time
+}
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
@@ -464,6 +488,167 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 		return nil
 	}
 	return dynamicModelsCache.ids
+}
+
+// pickSearchAccount 选号：首个可用 CN 账号（与 fetchDynamicModels 同口径——
+// AvailableUIDsForRealm("cn") 首个 + AuthByUID，目录同源；Pick 无 realm 过滤，
+// 混合池里会选中 global 号去打 CN 端点，PR #38 已给出的选号修复）。
+func (h *Handler) pickSearchAccount() *auth.Auth {
+	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return nil
+	}
+	return h.cfg.Pool.AuthByUID(uids[0])
+}
+
+// searchModelRates 返回当前倍率快照（升序）：TTL 内直接用缓存；过期/冷启动挑一个
+// CN 账号拉目录重建（负冷却内不再打上游，回退旧缓存/空——上游持续故障不放大请求）。
+func (h *Handler) searchModelRates() []upstream.SearchRate {
+	rates, fetched := upstream.ModelRatesSnapshot()
+	if len(rates) > 0 && time.Since(fetched) < h.cfg.SearchRefreshInterval {
+		return rates
+	}
+	searchRateCache.Lock()
+	lastFail := searchRateCache.lastFail
+	searchRateCache.Unlock()
+	if !lastFail.IsZero() && time.Since(lastFail) < searchRateFailCooldown {
+		return rates
+	}
+	acct := h.pickSearchAccount()
+	if acct == nil {
+		return rates // 无号：回退旧缓存（可能为空），不编造
+	}
+	// token 临近过期先 refresh（与 chat 同口径；失败不影响本次返回——
+	// 复用旧缓存，下次请求再试）。
+	if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		if err := h.cfg.Upstream.RefreshToken(acct); err == nil {
+			if err := acct.SaveAtomic(); err != nil {
+				log.Printf("ERR: [server] search rates refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+			}
+		}
+	}
+	if _, err := h.cfg.Upstream.RefreshModelRates(acct); err != nil {
+		searchRateCache.Lock()
+		searchRateCache.lastFail = time.Now()
+		searchRateCache.Unlock()
+		log.Printf("WARN: [server] search model rates refresh acct=%s: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+		return rates
+	}
+	rates, _ = upstream.ModelRatesSnapshot()
+	return rates
+}
+
+// searchMaxResultsCap /v1/search 单请求结果数上限（透传 upstream.searchMaxResultsCap）。
+const searchMaxResultsCap = upstream.SearchMaxResultsCap
+
+// search 处理 POST /v1/search：按模型倍率从低到高遍历，模型内逐号轮换
+// （PickExcludingForRealm + tried 标记），任一号搜索成功即返回；全池失败
+// 透传末端错误（与 chat 末端透传同口径）。
+func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	var req struct {
+		Query      string `json:"query"`
+		MaxResults int    `json:"max_results"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
+		return
+	}
+	req.Query = strings.TrimSpace(req.Query)
+	if req.Query == "" {
+		// 与上游 15003 同语义（query is required），不轮转不罚号。
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "query is required")
+		return
+	}
+	if req.MaxResults <= 0 {
+		req.MaxResults = 5
+	}
+	if req.MaxResults > searchMaxResultsCap {
+		req.MaxResults = searchMaxResultsCap
+	}
+
+	attempts := 0
+	var lastErr error
+	// 倍率升序遍历（searchModelRates 内含 TTL/负冷却的按需刷新）。
+	for _, sr := range h.searchModelRates() {
+		// tried 按模型隔离：上一模型试尽的账号对下一模型仍可用（realm=cn 过滤跨域，
+		// sr.Model 参与 6004 模型级冷却豁免——某号对某模型被限流不拖累搜索路由）。
+		tried := map[string]bool{}
+		for attempts < searchMaxAttempts {
+			acct := h.cfg.Pool.PickExcludingForRealm(tried, sr.Model, "cn")
+			if acct == nil {
+				break // 本模型所有可用账号已试尽 → 下一个模型
+			}
+			tried[acct.UID] = true
+			attempts++
+
+			// token 临近过期先 refresh（失败按分类罚号后换号，与 chat 同口径）。
+			if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+				if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+					lastErr = err
+					var ue *upstream.Error
+					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+						h.cfg.Pool.Disable(acct.UID, "search refresh session dead")
+					} else {
+						h.cfg.Pool.NoteError(acct.UID)
+					}
+					log.Printf("ERR: [server] search refresh acct=%s: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+					continue
+				}
+				if err := acct.SaveAtomic(); err != nil {
+					log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+				}
+			}
+
+			resp, err := h.cfg.Upstream.Search(r.Context(), acct, req.Query, req.MaxResults)
+			if err == nil {
+				log.Printf("OK: [server] search model=%s acct=%s results=%d", sr.Model, logfmt.Label(acct.UID, acct.Nickname), len(resp.Results))
+				writeJSON(w, http.StatusOK, map[string]any{
+					"query":    resp.Query,
+					"provider": resp.Provider,
+					"model":    sr.Model,
+					"results":  resp.Results,
+				})
+				return
+			}
+			lastErr = err
+			var ue *upstream.Error
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				// 401 + 12153：会话已死，禁用（禁用持久在 pool，下一模型自动跳过）。
+				h.cfg.Pool.Disable(acct.UID, "search session dead")
+			} else {
+				h.cfg.Pool.NoteError(acct.UID)
+			}
+			log.Printf("ERR: [server] search model=%s acct=%s: %v", sr.Model, logfmt.Label(acct.UID, acct.Nickname), err)
+		}
+		if attempts >= searchMaxAttempts {
+			break
+		}
+	}
+	// 末端错误透传（与 chat 同口径：上游原文优先，本地调度错误保留自有文案）。
+	status := http.StatusServiceUnavailable
+	code := "no_healthy_account"
+	msg := "all accounts are temporarily unavailable, please retry later"
+	var ue *upstream.Error
+	if errors.As(lastErr, &ue) {
+		switch ue.Kind {
+		case upstream.ErrSoftRate:
+			status = http.StatusTooManyRequests
+			code = "rate_limit_exceeded"
+			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+		case upstream.ErrHardCredit:
+			code = "insufficient_credits"
+			msg = "all accounts are out of credits, waiting for daily check-in to restore"
+		}
+		if s := strings.TrimSpace(ue.Msg); s != "" {
+			msg = s // 上游原文优先，不拼接本地前缀
+		}
+	}
+	writeOpenAIError(w, status, code, msg)
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {

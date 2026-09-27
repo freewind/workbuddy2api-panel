@@ -1525,3 +1525,156 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
 	}
 }
+
+// searchSeedRates 灌入倍率缓存（升序；free → cheap → expensive），隔离 FetchModels
+// 网络路径，handler 测试只聚焦 /v1/search 流程本身。
+func searchSeedRates() {
+	upstream.SeedModelRatesForTest([]upstream.SearchRate{
+		{Model: "free", Rate: 0},
+		{Model: "cheap", Rate: 0.05},
+		{Model: "expensive", Rate: 0.29},
+	})
+}
+
+// TestSearchEndpoint /v1/search 成功路径：按倍率升序选号（free 最前）、
+// 上游请求体/响应标准化。
+func TestSearchEndpoint(t *testing.T) {
+	searchSeedRates()
+	var gotPath, gotAuth, gotBody string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotPath = r.URL.Path
+			gotAuth = r.Header.Get("Authorization")
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					`{"query":"hello","type":"text2text","provider":"0","results":[{"title":"t1","url":"u1","snippet":"s1"}]}`)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"hello","max_results":3}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotPath != "/agenttool/v1/search" || gotAuth != "Bearer at1" {
+		t.Errorf("upstream path/auth = %s %q", gotPath, gotAuth)
+	}
+	var req struct {
+		Query      string `json:"query"`
+		Type       string `json:"type"`
+		MaxResults int    `json:"max_results"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &req); err != nil {
+		t.Fatalf("upstream body not json: %v %s", err, gotBody)
+	}
+	if req.Query != "hello" || req.Type != "text2text" || req.MaxResults != 3 {
+		t.Errorf("upstream request=%+v", req)
+	}
+	var out struct {
+		Query    string `json:"query"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		Results  []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Snippet string `json:"snippet"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("response not json: %v %s", err, rec.Body)
+	}
+	if out.Query != "hello" || out.Provider != "0" || out.Model != "free" {
+		t.Errorf("query=%q provider=%q model=%q want free (倍率升序最前)", out.Query, out.Provider, out.Model)
+	}
+	if len(out.Results) != 1 || out.Results[0].Title != "t1" || out.Results[0].URL != "u1" || out.Results[0].Snippet != "s1" {
+		t.Errorf("results=%+v", out.Results)
+	}
+}
+
+// TestSearchMissingQuery /v1/search 空 query → 400（不轮转不罚号）。
+func TestSearchMissingQuery(t *testing.T) {
+	searchSeedRates()
+	called := false
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			called = true
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"  "}`)))
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if called {
+		t.Error("upstream must not be called for missing query")
+	}
+}
+
+// TestSearchRotatesOnAccountFailure /v1/search 首号失败（500）→ tried 标记换号，
+// 第二个账号成功返回。
+func TestSearchRotatesOnAccountFailure(t *testing.T) {
+	searchSeedRates()
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Header.Get("X-User-Id") == "u1" {
+				return &http.Response{StatusCode: 500, Header: http.Header{"Content-Type": []string{"application/json"}},
+					Body: io.NopCloser(strings.NewReader(`boom`))}, nil
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"provider":"0","results":[{"title":"t","url":"u","snippet":"s"}]}`))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"hello"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Model   string `json:"model"`
+		Results []any  `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("response not json: %v", err)
+	}
+	if out.Model != "free" || len(out.Results) != 1 {
+		t.Errorf("model=%q results=%v want free + 1 result (换号后成功)", out.Model, out.Results)
+	}
+}
+
+// TestSearchNoRatesNoAccount /v1/search 无倍率缓存 + 目录刷新失败 → 503，
+// 且不调用搜索端点。
+func TestSearchNoRatesNoAccount(t *testing.T) {
+	upstream.SeedModelRatesForTest(nil)
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// 目录与搜索端点全部失败。
+			return &http.Response{StatusCode: 500, Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`boom`))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/search", strings.NewReader(`{"query":"hello"}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), `"results"`) {
+		t.Errorf("must not return results, body=%s", rec.Body)
+	}
+}
