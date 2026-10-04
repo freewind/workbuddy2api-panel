@@ -593,7 +593,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th><th class="num">点数</th>
               <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
@@ -608,7 +608,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th><th class="num">点数</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
@@ -622,9 +622,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th><th class="num">点数</th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>请求明细</h3><span class="grow"></span>
+          <span class="note">按时间倒序，最近 2000 条</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>时间</th><th>账号</th><th>模型</th>
+              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">延迟</th><th class="num">速率</th><th class="num">点数</th><th>状态</th>
+            </tr></thead>
+            <tbody id="usReqBody"></tbody>
           </table>
         </div>
       </div>

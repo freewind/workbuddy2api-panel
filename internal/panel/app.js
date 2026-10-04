@@ -1228,6 +1228,14 @@ function fmtMs(ms) {
   return Math.round(ms) + 'ms';
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+// fmtCredit 显示消耗点数（上游 usage.credit）；整数化以保持表格宽度稳定。
+function fmtCredit(v) {
+  const n = Number(v || 0);
+  if (!n) return '0';
+  if (n >= 100) return String(Math.round(n));
+  if (n >= 10) return n.toFixed(1);
+  return n.toFixed(2);
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
@@ -1259,6 +1267,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtCredit(a.credits) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1274,6 +1283,7 @@ function renderUsage(d) {
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
+    usStat(fmtCredit(t.credits), '消耗点数') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
@@ -1289,13 +1299,32 @@ function renderUsage(d) {
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+
+  // 请求明细：后端按时间升序返回，前端反转成「最新在上」，便于回看最近发生了什么。
+  const recent = (d.recent || []).slice().reverse();
+  $('usReqBody').innerHTML = recent.map(r => {
+    const ts = r.ts ? String(r.ts).replace('T', ' ').slice(5, 19) : '—';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td class="num">' + esc(ts) + '</td>' +
+      '<td>' + esc((r.uid || '').slice(0, 8)) + '</td>' +
+      '<td>' + esc(r.model || '') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.prompt_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.completion_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.total_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtMs(r.latency_ms) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtRate(r.tokens_per_second) : '—') + '</td>' +
+      '<td class="num">' + (r.has_credit ? fmtCredit(r.credit) : '—') + '</td>' +
+      '<td' + (r.ok ? '' : ' style="color:var(--warn)"') + '>' + (r.ok ? '成功' : '失败') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   renderUsageChart(d.series || []);
 }

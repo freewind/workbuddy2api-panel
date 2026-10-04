@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -116,6 +117,66 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	// since 是全库数据起点，不受窗口影响。
 	if all.Since == "" || s.Since != all.Since {
 		t.Fatalf("since 应为全库起点且不随窗口变化: all=%q windowed=%q", all.Since, s.Since)
+	}
+}
+
+// 点数聚合进既有口径 + 逐请求明细按时间顺序记录（含失败尝试）。
+func TestCreditAggAndRecent(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, LatencyMs: 200, HasLatency: true, Credit: 1.5, HasCredit: true}, true)
+	r.Add(now.Add(time.Second), "cn", "u1", "glm-5.2", Delta{Credit: 2.0, HasCredit: true}, true)
+	// 失败尝试：无 usage/无 credit，但明细仍要出现（重试放大要看得见）。
+	r.Add(now.Add(2*time.Second), "global", "u2", "claude-4.6", Delta{}, false)
+
+	s := r.Snapshot(24, nil)
+	if s.Totals.Credits != 3.5 {
+		t.Fatalf("totals credits = %v, want 3.5", s.Totals.Credits)
+	}
+	if len(s.ByModel) != 2 {
+		t.Fatalf("by_model = %d 项, want 2", len(s.ByModel))
+	}
+	// 按模型点数聚合（glm-5.2 两次共 3.5）。
+	for _, m := range s.ByModel {
+		if m.Key == "glm-5.2" && m.Credits != 3.5 {
+			t.Fatalf("by_model glm-5.2 credits = %v, want 3.5", m.Credits)
+		}
+	}
+
+	if len(s.Recent) != 3 {
+		t.Fatalf("recent len = %d, want 3", len(s.Recent))
+	}
+	// 时间升序 = append 顺序。
+	if s.Recent[0].Model != "glm-5.2" || s.Recent[2].Model != "claude-4.6" {
+		t.Fatalf("recent 顺序错误: %+v", s.Recent)
+	}
+	if !s.Recent[0].HasCred || s.Recent[0].Credit != 1.5 {
+		t.Fatalf("recent[0] credit = %v/%v, want 1.5/true", s.Recent[0].Credit, s.Recent[0].HasCred)
+	}
+	if s.Recent[0].TT != 150 {
+		t.Fatalf("recent[0] total = %d, want 150（无 total 时 pt+ct 兜底）", s.Recent[0].TT)
+	}
+	if s.Recent[2].OK || s.Recent[2].HasCred {
+		t.Fatalf("失败尝试应 ok=false 且无 credit: %+v", s.Recent[2])
+	}
+}
+
+// 明细环形按 recentCap 截断：超出后淘汰最旧条目，只保留最近 recentCap 条。
+func TestRecentRingCap(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	for i := range recentCap + 50 {
+		r.Add(now.Add(time.Duration(i)*time.Millisecond), "cn", "u1", fmt.Sprintf("m%05d", i), Delta{}, false)
+	}
+	s := r.Snapshot(24, nil)
+	if len(s.Recent) != recentCap {
+		t.Fatalf("recent len = %d, want %d", len(s.Recent), recentCap)
+	}
+	if got := s.Recent[0].Model; got != "m00050" {
+		t.Fatalf("最旧保留条 = %q, want m00050（应淘汰前 50 条）", got)
+	}
+	if got := s.Recent[len(s.Recent)-1].Model; got != fmt.Sprintf("m%05d", recentCap+49) {
+		t.Fatalf("最新条 = %q, want m%05d", got, recentCap+49)
 	}
 }
 

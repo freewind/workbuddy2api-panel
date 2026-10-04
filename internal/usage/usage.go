@@ -35,6 +35,10 @@ const flushInterval = 30 * time.Second
 // maxBuckets 桶数硬上限。超过时立即触发一次折叠，避免异常流量把内存/文件撑爆。
 const maxBuckets = 400_000
 
+// recentCap 逐请求明细环形的容量：内存保留最近 recentCap 条（不落盘）。
+// 明细是运维视角的「最近发生了什么」，与聚合桶（长期保留）分工不同，故有界。
+const recentCap = 2000
+
 // hourLayout / dayLayout 分片键的时间格式（本地时区，与用户直觉一致）。
 const (
 	hourLayout = "2006-01-02T15"
@@ -57,6 +61,7 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+	Cr    float64 `json:"k"`  // 消耗点数（credits）累计
 }
 
 // file 落盘结构。
@@ -71,6 +76,7 @@ type Recorder struct {
 	mu      sync.Mutex
 	path    string
 	buckets map[string]*bucket // key: scope|realm|uid|model
+	recent  []Request          // 逐请求明细环形（最近 recentCap 条，时间升序）
 	dirty   bool
 	started time.Time
 
@@ -138,6 +144,25 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	Credit           float64 // 本次真实扣费积分（上游 usage.credit）
+	HasCredit        bool
+}
+
+// Request 一次请求尝试的明细行（逐请求环形缓冲的元素）。
+// 与聚合桶不同，它保留单次的全部可观测字段，供「请求明细」视图按时间回看。
+type Request struct {
+	TS      string  `json:"ts"` // 本地时间（RFC3339）
+	Realm   string  `json:"realm"`
+	UID     string  `json:"uid"`
+	Model   string  `json:"model"`
+	PT      int64   `json:"prompt_tokens"`
+	CT      int64   `json:"completion_tokens"`
+	TT      int64   `json:"total_tokens"`
+	LatMs   int64   `json:"latency_ms"`
+	TPS     float64 `json:"tokens_per_second"`
+	Credit  float64 `json:"credit"`     // 消耗点数
+	HasCred bool    `json:"has_credit"` // 上游是否给出 credit（区分「免费 0」与「未观测」）
+	OK      bool    `json:"ok"`         // 该次尝试是否拿到 usage（失败=false）
 }
 
 // Add 记录一次请求尝试。
@@ -189,7 +214,33 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
+	if d.HasCredit {
+		b.Cr += d.Credit
+	}
 	r.dirty = true
+
+	// 逐请求明细：与聚合桶分开维护，只留最近 recentCap 条（内存，不落盘）。
+	total := d.TotalTokens
+	if !d.HasTotal && (d.HasPromptTokens || d.HasCompletion) {
+		total = d.PromptTokens + d.CompletionTokens
+	}
+	r.recent = append(r.recent, Request{
+		TS:      now.Format(time.RFC3339),
+		Realm:   realm,
+		UID:     uid,
+		Model:   model,
+		PT:      d.PromptTokens,
+		CT:      d.CompletionTokens,
+		TT:      total,
+		LatMs:   d.LatencyMs,
+		TPS:     d.TokensPerSecond,
+		Credit:  d.Credit,
+		HasCred: d.HasCredit,
+		OK:      ok,
+	})
+	if overflow := len(r.recent) - recentCap; overflow > 0 {
+		r.recent = r.recent[overflow:]
+	}
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶（按本地日历日）。
@@ -237,6 +288,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
+			dst.Cr += src.Cr
 		}
 		delete(r.buckets, m.from)
 	}
@@ -317,6 +369,7 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	Credits       float64 `json:"credits"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -339,6 +392,7 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	g.Credits += b.Cr
 }
 
 func (g *aggAcc) finish() Agg {
@@ -374,6 +428,7 @@ type Snapshot struct {
 	ByAccount []KeyedAgg `json:"by_account"`
 	ByModel   []KeyedAgg `json:"by_model"`
 	Series    []Point    `json:"series"`
+	Recent    []Request  `json:"recent"` // 逐请求明细（时间升序，最近 recentCap 条）
 	Buckets   int        `json:"buckets"`
 	FileBytes int64      `json:"file_bytes"`
 	Since     string     `json:"since,omitempty"`
@@ -404,6 +459,8 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	for _, b := range r.buckets {
 		bs = append(bs, *b)
 	}
+	recent := make([]Request, len(r.recent))
+	copy(recent, r.recent)
 	r.mu.Unlock()
 
 	var total aggAcc
@@ -487,6 +544,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			return k, nicks[k]
 		}),
 		ByModel:   keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		Recent:    recent,
 		Buckets:   matched,
 		Generated: time.Now().Format(time.RFC3339),
 	}
