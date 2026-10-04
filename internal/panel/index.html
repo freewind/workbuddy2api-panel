@@ -424,6 +424,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#requests" data-view="requests">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11v9h-11z"/><path d="M2.5 6.5h11M6 9.5h4"/></svg>
+        请求明细</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -629,9 +632,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
+    </section>
+
+    <!-- 请求明细 -->
+    <section class="view" id="view-requests" hidden>
       <div class="box">
-        <header><h3>请求明细</h3><span class="grow"></span>
-          <span class="note">按时间倒序，最近 2000 条</span></header>
+        <header>
+          <h3>请求明细</h3>
+          <span class="grow"></span>
+          <span class="note" id="rqNote">—</span>
+          <select id="rqSize" class="xs">
+            <option value="50">每页 50</option>
+            <option value="100" selected>每页 100</option>
+            <option value="200">每页 200</option>
+          </select>
+          <button class="xs" id="btnRq">刷新</button>
+        </header>
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
@@ -639,8 +655,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
               <th class="num">延迟</th><th class="num">速率</th><th class="num">点数</th><th>状态</th>
             </tr></thead>
-            <tbody id="usReqBody"></tbody>
+            <tbody id="rqBody"></tbody>
           </table>
+        </div>
+        <div class="pad" style="display:flex;align-items:center;gap:8px">
+          <button class="xs" id="rqPrev">上一页</button>
+          <span class="note" id="rqPage">—</span>
+          <button class="xs" id="rqNext">下一页</button>
+          <span class="grow"></span>
+          <span class="note">明细仅驻留内存，重启后清空</span>
         </div>
       </div>
     </section>

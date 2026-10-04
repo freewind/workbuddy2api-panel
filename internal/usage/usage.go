@@ -39,6 +39,12 @@ const maxBuckets = 400_000
 // 明细是运维视角的「最近发生了什么」，与聚合桶（长期保留）分工不同，故有界。
 const recentCap = 2000
 
+// 明细分页的默认页大小与上限（Requests 参数越界时钳到这里）。
+const (
+	defaultPageSize = 100
+	maxPageSize     = 500
+)
+
 // hourLayout / dayLayout 分片键的时间格式（本地时区，与用户直觉一致）。
 const (
 	hourLayout = "2006-01-02T15"
@@ -428,7 +434,6 @@ type Snapshot struct {
 	ByAccount []KeyedAgg `json:"by_account"`
 	ByModel   []KeyedAgg `json:"by_model"`
 	Series    []Point    `json:"series"`
-	Recent    []Request  `json:"recent"` // 逐请求明细（时间升序，最近 recentCap 条）
 	Buckets   int        `json:"buckets"`
 	FileBytes int64      `json:"file_bytes"`
 	Since     string     `json:"since,omitempty"`
@@ -459,8 +464,6 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	for _, b := range r.buckets {
 		bs = append(bs, *b)
 	}
-	recent := make([]Request, len(r.recent))
-	copy(recent, r.recent)
 	r.mu.Unlock()
 
 	var total aggAcc
@@ -544,7 +547,6 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			return k, nicks[k]
 		}),
 		ByModel:   keyed(modelAgg, func(k string) (string, string) { return k, "" }),
-		Recent:    recent,
 		Buckets:   matched,
 		Generated: time.Now().Format(time.RFC3339),
 	}
@@ -579,6 +581,55 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	// 无任何桶时保持空（无数据不伪造起点）。
 	snap.Since = strings.TrimPrefix(strings.TrimPrefix(since, "h:"), "d:")
 	return snap
+}
+
+// Page 一页逐请求明细。
+type Page struct {
+	Page  int       `json:"page"`
+	Size  int       `json:"size"`
+	Total int       `json:"total"`
+	Items []Request `json:"items"`
+}
+
+// Requests 返回逐请求明细的一页（**时间倒序**，最新在前）。
+//
+// size<=0 取 defaultPageSize，上限 maxPageSize；page<1 视为 1。越界页返回空
+// items 而非回退到首页——前端据此把「下一页」置灰，语义明确。
+//
+// 不对某一页做固定快照：翻页期间新请求会入环、总数会变。运维视角要的是「最近
+// 这一批」，实时边界比翻页不跳更重要。
+func (r *Recorder) Requests(page, size int) Page {
+	if page < 1 {
+		page = 1
+	}
+	if size <= 0 {
+		size = defaultPageSize
+	}
+	if size > maxPageSize {
+		size = maxPageSize
+	}
+	out := Page{Page: page, Size: size, Items: []Request{}}
+	if r == nil {
+		return out
+	}
+
+	r.mu.Lock()
+	total := len(r.recent)
+	end := total - (page-1)*size
+	if end < 0 {
+		end = 0
+	}
+	start := end - size
+	if start < 0 {
+		start = 0
+	}
+	for i := end - 1; i >= start; i-- {
+		out.Items = append(out.Items, r.recent[i])
+	}
+	r.mu.Unlock()
+
+	out.Total = total
+	return out
 }
 
 func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {

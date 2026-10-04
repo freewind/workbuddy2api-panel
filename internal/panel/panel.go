@@ -174,6 +174,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	p.mux.HandleFunc("GET /panel/api/usage/requests", p.withAuth(p.usageRequests))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
@@ -571,6 +572,28 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+}
+
+// usageRequests 返回逐请求明细的一页（时间倒序）。page 从 1 起，size 默认 100、
+// 上限 500（在 usage.Requests 内钳制，越界值不报错）。明细为内存环形，重启即清空。
+func (p *Panel) usageRequests(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	page := 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	size := 0
+	if v := r.URL.Query().Get("size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			size = n
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.Requests(page, size))
 }
 
 // usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。

@@ -120,8 +120,8 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	}
 }
 
-// 点数聚合进既有口径 + 逐请求明细按时间顺序记录（含失败尝试）。
-func TestCreditAggAndRecent(t *testing.T) {
+// 点数聚合进既有口径（Snapshot 不再内联明细）。
+func TestCreditAgg(t *testing.T) {
 	r := New("")
 	now := time.Now()
 	r.Add(now, "cn", "u1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, LatencyMs: 200, HasLatency: true, Credit: 1.5, HasCredit: true}, true)
@@ -142,22 +142,42 @@ func TestCreditAggAndRecent(t *testing.T) {
 			t.Fatalf("by_model glm-5.2 credits = %v, want 3.5", m.Credits)
 		}
 	}
+}
 
-	if len(s.Recent) != 3 {
-		t.Fatalf("recent len = %d, want 3", len(s.Recent))
+// 明细分页：时间倒序、默认页大小 100、size 越界钳到上限、越界页返回空。
+func TestRequestsPaging(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, Credit: 1.5, HasCredit: true}, true)
+	r.Add(now.Add(time.Second), "global", "u2", "claude-4.6", Delta{Credit: 2.0, HasCredit: true}, true)
+	r.Add(now.Add(2*time.Second), "cn", "u3", "hy3-x", Delta{}, false)
+
+	p := r.Requests(1, 0)
+	if p.Size != defaultPageSize || p.Total != 3 || len(p.Items) != 3 {
+		t.Fatalf("第一页 = size %d total %d items %d, want %d/3/3", p.Size, p.Total, len(p.Items), defaultPageSize)
 	}
-	// 时间升序 = append 顺序。
-	if s.Recent[0].Model != "glm-5.2" || s.Recent[2].Model != "claude-4.6" {
-		t.Fatalf("recent 顺序错误: %+v", s.Recent)
+	// 时间倒序：最新在最前。
+	if p.Items[0].Model != "hy3-x" || p.Items[2].Model != "glm-5.2" {
+		t.Fatalf("明细顺序错误（应时间倒序）: %+v", p.Items)
 	}
-	if !s.Recent[0].HasCred || s.Recent[0].Credit != 1.5 {
-		t.Fatalf("recent[0] credit = %v/%v, want 1.5/true", s.Recent[0].Credit, s.Recent[0].HasCred)
+	if !p.Items[1].HasCred || p.Items[1].Credit != 2.0 {
+		t.Fatalf("items[1] credit = %v/%v, want 2.0/true", p.Items[1].Credit, p.Items[1].HasCred)
 	}
-	if s.Recent[0].TT != 150 {
-		t.Fatalf("recent[0] total = %d, want 150（无 total 时 pt+ct 兜底）", s.Recent[0].TT)
+	if p.Items[2].TT != 150 {
+		t.Fatalf("items[2] total = %d, want 150（无 total 时 pt+ct 兜底）", p.Items[2].TT)
 	}
-	if s.Recent[2].OK || s.Recent[2].HasCred {
-		t.Fatalf("失败尝试应 ok=false 且无 credit: %+v", s.Recent[2])
+	if p.Items[0].OK || p.Items[0].HasCred {
+		t.Fatalf("失败尝试应 ok=false 且无 credit: %+v", p.Items[0])
+	}
+	// 第二页起为空（总数不足一页），但 total 仍报真实总数。
+	if p2 := r.Requests(2, 100); len(p2.Items) != 0 || p2.Total != 3 {
+		t.Fatalf("第二页 items = %d total = %d, want 0/3", len(p2.Items), p2.Total)
+	}
+	if p3 := r.Requests(99, 100); len(p3.Items) != 0 {
+		t.Fatalf("越界页应返回空, got %d 条", len(p3.Items))
+	}
+	if p4 := r.Requests(1, 10000); p4.Size != maxPageSize {
+		t.Fatalf("size 越界 = %d, want %d", p4.Size, maxPageSize)
 	}
 }
 
@@ -168,15 +188,19 @@ func TestRecentRingCap(t *testing.T) {
 	for i := range recentCap + 50 {
 		r.Add(now.Add(time.Duration(i)*time.Millisecond), "cn", "u1", fmt.Sprintf("m%05d", i), Delta{}, false)
 	}
-	s := r.Snapshot(24, nil)
-	if len(s.Recent) != recentCap {
-		t.Fatalf("recent len = %d, want %d", len(s.Recent), recentCap)
+	p := r.Requests(1, defaultPageSize)
+	if p.Total != recentCap {
+		t.Fatalf("total = %d, want %d", p.Total, recentCap)
 	}
-	if got := s.Recent[0].Model; got != "m00050" {
-		t.Fatalf("最旧保留条 = %q, want m00050（应淘汰前 50 条）", got)
-	}
-	if got := s.Recent[len(s.Recent)-1].Model; got != fmt.Sprintf("m%05d", recentCap+49) {
+	// 第一页第一条 = 全库最新（第 recentCap+50-1 次写入）。
+	if got := p.Items[0].Model; got != fmt.Sprintf("m%05d", recentCap+49) {
 		t.Fatalf("最新条 = %q, want m%05d", got, recentCap+49)
+	}
+	// 最旧保留的那条落在最后一页（第 51 次写入）。
+	last := r.Requests(recentCap/defaultPageSize, defaultPageSize)
+	oldest := last.Items[len(last.Items)-1]
+	if got := oldest.Model; got != "m00050" {
+		t.Fatalf("最旧保留条 = %q, want m00050（应淘汰前 50 条）", got)
 	}
 }
 

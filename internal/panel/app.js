@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', requests: '请求明细', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -136,6 +136,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
+  if (v === 'requests') loadRequests();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') reattachQueueView();
 }
@@ -1307,25 +1308,6 @@ function renderUsage(d) {
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
-  // 请求明细：后端按时间升序返回，前端反转成「最新在上」，便于回看最近发生了什么。
-  const recent = (d.recent || []).slice().reverse();
-  $('usReqBody').innerHTML = recent.map(r => {
-    const ts = r.ts ? String(r.ts).replace('T', ' ').slice(5, 19) : '—';
-    return '<tr>' +
-      '<td class="mark" aria-hidden="true"></td>' +
-      '<td class="num">' + esc(ts) + '</td>' +
-      '<td>' + esc((r.uid || '').slice(0, 8)) + '</td>' +
-      '<td>' + esc(r.model || '') + '</td>' +
-      '<td class="num">' + (r.ok ? fmtTok(r.prompt_tokens) : '—') + '</td>' +
-      '<td class="num">' + (r.ok ? fmtTok(r.completion_tokens) : '—') + '</td>' +
-      '<td class="num">' + (r.ok ? fmtTok(r.total_tokens) : '—') + '</td>' +
-      '<td class="num">' + (r.ok ? fmtMs(r.latency_ms) : '—') + '</td>' +
-      '<td class="num">' + (r.ok ? fmtRate(r.tokens_per_second) : '—') + '</td>' +
-      '<td class="num">' + (r.has_credit ? fmtCredit(r.credit) : '—') + '</td>' +
-      '<td' + (r.ok ? '' : ' style="color:var(--warn)"') + '>' + (r.ok ? '成功' : '失败') + '</td>' +
-      '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
-
   renderUsageChart(d.series || []);
 }
 
@@ -1476,6 +1458,59 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+
+/* ── 请求明细 ───────────────────────────────────────────────────────── */
+/* 逐请求记录由后端内存环形持有（最近 2000 条，重启清空），与用量聚合是两条
+   独立数据源：聚合长期保留、明细只看最近，因此分页只按 page/size 取，不参与
+   用量视图的 hours 窗口。翻页期间新请求会入环，总数随之增长——按「看最近」处理，
+   不为固定快照付出复杂度。 */
+let rqPage = 1;
+
+function renderRequests(d) {
+  const items = d.items || [];
+  $('rqBody').innerHTML = items.map(r => {
+    const ts = r.ts ? String(r.ts).replace('T', ' ').slice(5, 19) : '—';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td class="num">' + esc(ts) + '</td>' +
+      '<td>' + esc((r.uid || '').slice(0, 8)) + '</td>' +
+      '<td>' + esc(r.model || '') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.prompt_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.completion_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtTok(r.total_tokens) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtMs(r.latency_ms) : '—') + '</td>' +
+      '<td class="num">' + (r.ok ? fmtRate(r.tokens_per_second) : '—') + '</td>' +
+      '<td class="num">' + (r.has_credit ? fmtCredit(r.credit) : '—') + '</td>' +
+      '<td' + (r.ok ? '' : ' style="color:var(--warn)"') + '>' + (r.ok ? '成功' : '失败') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
+
+  const size = d.size || 100;
+  const total = d.total || 0;
+  const pages = Math.max(1, Math.ceil(total / size));
+  // 后端对越界页返回空 items；此时把页码收回最后一页，避免停在空白页。
+  if (!items.length && rqPage > pages) rqPage = pages;
+  $('rqPage').textContent = '第 ' + rqPage + ' / ' + pages + ' 页';
+  $('rqNote').textContent = '共 ' + fmtTok(total) + ' 条';
+  $('rqPrev').disabled = rqPage <= 1;
+  $('rqNext').disabled = rqPage >= pages;
+}
+
+async function loadRequests() {
+  const size = ($('rqSize') && $('rqSize').value) || 100;
+  try {
+    const d = await api('usage/requests?page=' + encodeURIComponent(rqPage) + '&size=' + encodeURIComponent(size));
+    rqPage = Math.max(1, d.page || 1);
+    renderRequests(d);
+  } catch (e) {
+    $('rqBody').innerHTML = '<tr><td colspan="11" class="empty">读取明细失败：' + esc(e.message) + '</td></tr>';
+  }
+}
+
+if ($('btnRq')) $('btnRq').onclick = () => { rqPage = 1; loadRequests(); };
+if ($('rqSize')) $('rqSize').onchange = () => { rqPage = 1; loadRequests(); };
+if ($('rqPrev')) $('rqPrev').onclick = () => { if (rqPage > 1) { rqPage--; loadRequests(); } };
+if ($('rqNext')) $('rqNext').onclick = () => { rqPage++; loadRequests(); };
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
